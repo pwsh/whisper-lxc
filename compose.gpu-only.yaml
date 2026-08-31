@@ -1,0 +1,16 @@
+# Override for a host with an Intel GPU but no NPU (anything before Meteor Lake,
+# or a machine whose intel_vpu module is not loaded).
+#
+#     docker compose -f compose.yaml -f compose.gpu-only.yaml up -d
+#
+# or, less to remember, in .env next to compose.yaml:
+#
+#     COMPOSE_FILE=compose.yaml:compose.gpu-only.yaml
+#
+# `devices:` is a replace-not-merge list in compose, so naming the one device here
+# drops /dev/accel/accel0 entirely.  Set DEVICES=GPU in .env as well, or
+# prepare-models.sh will build NPU graph directories that can never load.
+services:
+  ovms:
+    devices:
+      - ${GPU_DEV:-/dev/dri/renderD128}:/dev/dri/renderD128

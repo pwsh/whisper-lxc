@@ -1,0 +1,97 @@
+# The whisper appliance: ONE OpenVINO Model Server, serving every configured
+# (model × device) pair at once on port 8000.
+#
+# One process, not one per device.  OVMS bakes `target_device:` into the
+# `graph.pbtxt` it finds in each model directory, so two directories that share
+# the same IR files but carry different graphs are two independent servables —
+# and a request picks between them with nothing but the `model` form field:
+#
+#   POST /v3/audio/transcriptions  -F model=whisper-large-v3-turbo-gpu   -> Arc iGPU
+#   POST /v3/audio/transcriptions  -F model=whisper-large-v3-turbo-npu   -> AI Boost NPU
+#
+# prepare-models.sh builds those directories and /models/config.json.  Run it
+# before the first `up`; setup-inside.sh does.
+#
+# Ports are published on ALL interfaces on purpose: this box exists to be called
+# from other machines.  It has no authentication of its own — keep it on a trusted
+# LAN or put a reverse proxy in front of it.
+name: whisper
+
+services:
+  ovms:
+    image: openvino/model_server:${OVMS_IMAGE_TAG:-weekly}
+    # Pin the *weekly* tag.  :latest and :latest-gpu (July 2026 builds) do not work
+    # on Lunar Lake at all: the GPU plugin dies in `contexts.count(device_id)` and
+    # the NPU compiler answers "unable to compile on the given platform".
+    env_file:
+      - path: .env
+        required: false
+
+    # Root, deliberately.  The `models` volume is created root-owned and OVMS runs
+    # as uid 5000 in the image, so it cannot create /models/.ovms_cache — the
+    # server then starts, serves, and silently recompiles the model on every
+    # restart (95 s for large-v3-turbo on the NPU).  Inside an *unprivileged* LXC
+    # this root is already mapped to an unprivileged uid on the Proxmox node.
+    user: "0:0"
+
+    command:
+      - --config_path
+      - /models/config.json
+      - --cache_dir
+      - /models/.ovms_cache
+      - --rest_port
+      - "8000"
+      - --rest_bind_address
+      - 0.0.0.0
+      - --log_level
+      - ${OVMS_LOG_LEVEL:-INFO}
+
+    devices:
+      # The Arc iGPU and the Lunar Lake NPU.  Compose has no conditionals, so a
+      # host without an NPU uses the override:
+      #     docker compose -f compose.yaml -f compose.gpu-only.yaml up -d
+      # (or COMPOSE_FILE=compose.yaml:compose.gpu-only.yaml in .env — setup-inside.sh
+      # sets that for you when NPU=0).  Compose refuses to start a service whose
+      # device node does not exist, so this is not optional on such a host.
+      - ${GPU_DEV:-/dev/dri/renderD128}:/dev/dri/renderD128
+      - ${NPU_DEV:-/dev/accel/accel0}:/dev/accel/accel0
+
+    group_add:
+      # The `render` gid INSIDE this container's guest (992 on Debian 13), which is
+      # also the gid `pct set --dev0 …,gid=992` gave the device nodes.  This is the
+      # whole of the permission story; get it wrong and OVMS sees only the CPU.
+      - "${RENDER_GID:-992}"
+
+    volumes:
+      # The IR models, the per-device graph directories, config.json, AND the
+      # compiled-blob cache.  OVMS defaults --cache_dir to /opt/cache *inside the
+      # image*, which is why the command line points it in here: losing this volume
+      # costs a re-download and a fresh NPU compile, not correctness.
+      - models:/models
+
+    ports:
+      - "${PORT:-8000}:8000"
+
+    healthcheck:
+      # /v1/models is OVMS's OpenAI-shaped model list and is the same probe the
+      # a typical OpenAI-compatible client uses for health.  The `grep` is load-bearing:
+      # the REST server binds and answers 200 with `{"data":[]}` a second after
+      # start, while it is still compiling, so a bare `curl -sf` reports the
+      # container healthy for the several minutes before it can transcribe
+      # anything.  Measured, not theorised.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models | grep -q '\"id\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # A cold start compiles every servable in config.json, one after another.
+      # Measured on a Core Ultra 7 258V: six servables (turbo + medium, each on
+      # GPU and NPU, plus two aliases) took 220 s from an empty cache.  With the
+      # cache warm in the volume the same six are back in 5-20 s, so only the
+      # very first start is slow — which is the whole reason --cache_dir points
+      # into the volume instead of at /opt/cache inside the image.
+      start_period: 400s
+
+    restart: unless-stopped
+
+volumes:
+  models:
